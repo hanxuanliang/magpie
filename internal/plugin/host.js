@@ -2740,7 +2740,8 @@ async function apiKey({ provider, method, inputs, key, account, proxy }, signal)
 // a refresh token once turns a second away). A renewal that fails leaves
 // the sign-in as it was, for the vendor's answer to tell, and isn't tried
 // again for RENEW_RETRY, or, turned away for good, till it is signed in
-// again.
+// again. Nor is one that leaves the sign-in still due (nothing given back,
+// or an expires inside refreshLead): one with no new token isn't saved.
 
 const RENEW_LEAD = 5 * 60 * 1000
 const RENEW_WAIT = 15 * 1000
@@ -2935,17 +2936,39 @@ async function renewLocked(provider, key, a, was) {
     send({ event: "log", level: "error", message: `${auths().get(provider)?.spec ?? provider}: auth.refresh: ${e?.message ?? e}` })
     return
   }
-  if (!got || typeof got !== "object") return
+  // A renewal that leaves the sign-in due (nothing given back, or an
+  // expires still inside the plugin's own refreshLead) would be renewed
+  // again by the next thing to use the account, and each save tells
+  // magpie the sign-ins changed, which lists every provider again: every
+  // plugin's vendor was asked every few seconds for as long as magpie ran.
+  // So it isn't tried again for RENEW_RETRY, as a failed one isn't, and one
+  // that brought no new token is not saved: it renewed nothing.
+  const hold = (secret, error) => unrenewed.set(key, { at: Date.now(), secret, gone: false, error })
+  if (!got || typeof got !== "object") {
+    hold(secretOf(was), "")
+    return
+  }
+  const { type: _t, ...fields } = got
+  const next = { ...was, ...fields, type: "oauth" }
+  const due = renewAt(a, next)
+  const still = due !== 0 && Date.now() >= due
+  const why = `auth.refresh gave back an expires within its refreshLead (${Math.round(leadOf(a) / 60e3)} min), so the sign-in is still due`
+  if (still && !changed(next, was)) {
+    hold(secretOf(was), why)
+    send({ event: "log", level: "error", message: `${auths().get(provider)?.spec ?? provider}: ${why}; tried again in ${RENEW_RETRY / 1000}s` })
+    return
+  }
   // signed out, signed in again or renewed by another host while it ran:
   // that one stands. Checked under the lock the save is made under, so
   // nothing comes between the two.
-  const { type: _t, ...fields } = got
   const kept = await changeAuth((all) => {
     if (changed(all[key], was)) return false
-    all[key] = { ...was, ...fields, type: "oauth" }
+    all[key] = next
   })
   if (kept === false) return
   unrenewed.delete(key)
+  // a new token that is due already: kept, and not renewed again at once
+  if (still) hold(secretOf(next), why)
   forgetAccount(key)
   send({ event: "auth", provider, account: key })
   send({ event: "signIn", provider, account: key, said: "renewed" })
